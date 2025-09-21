@@ -2,7 +2,7 @@ import { useCallback, useState } from "react";
 import { useDropzone } from "react-dropzone";
 import { Button } from "./ui/button";
 import { Card } from "./ui/card";
-import { useVision3D } from "../lib/stores/useVision3D";
+import { useVision3D } from "../lib/stores/useVision3D.tsx";
 import { Upload, X, Image as ImageIcon } from "lucide-react";
 
 export default function ImageUploader() {

@@ -61,14 +61,19 @@ export async function extractImageFeatures(buffer: Buffer): Promise<{
   sharpness: number;
 }> {
   // Get image statistics
-  const { stats } = await sharp(buffer)
+  const { data, info } = await sharp(buffer)
     .greyscale()
     .raw()
     .toBuffer({ resolveWithObject: true });
 
   // Calculate basic image quality metrics
-  const brightness = stats ? (stats.mean || [0])[0] / 255 : 0;
-  const contrast = stats ? Math.sqrt((stats.variance || [0])[0]) / 255 : 0;
+  const pixels = new Uint8Array(data);
+  const sum = pixels.reduce((acc, val) => acc + val, 0);
+  const brightness = sum / (pixels.length * 255);
+  
+  const mean = sum / pixels.length;
+  const variance = pixels.reduce((acc, val) => acc + Math.pow(val - mean, 2), 0) / pixels.length;
+  const contrast = Math.sqrt(variance) / 255;
   
   // Simple sharpness estimation (would be more complex in real implementation)
   const sharpness = contrast; // Simplified metric

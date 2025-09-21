@@ -382,7 +382,7 @@ async function generateMesh(points3D: Point3D[], sourceImageCount: number): Prom
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
   geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-  geometry.setIndex(faces);
+  geometry.setIndex(Array.from(faces));
   geometry.computeVertexNormals();
   
   // Create material

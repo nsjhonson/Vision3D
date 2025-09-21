@@ -1,8 +1,8 @@
 import { useState } from "react";
 import { Button } from "./ui/button";
 import { Card } from "./ui/card";
-import { useVision3D } from "../lib/stores/useVision3D";
-import { exportToOBJ, exportToGLTF } from "../lib/objExporter";
+import { useVision3D } from "../lib/stores/useVision3D.tsx";
+import { exportToOBJ, exportToGLTF } from "../lib/objExporter.ts";
 import { Download, FileDown, Package } from "lucide-react";
 
 export default function ExportPanel() {

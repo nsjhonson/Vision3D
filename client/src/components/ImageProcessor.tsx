@@ -2,8 +2,8 @@ import { useState, useEffect } from "react";
 import { Button } from "./ui/button";
 import { Card } from "./ui/card";
 import { Progress } from "./ui/progress";
-import { useVision3D } from "../lib/stores/useVision3D";
-import { removeBackground } from "../lib/backgroundRemoval";
+import { useVision3D } from "../lib/stores/useVision3D.tsx";
+import { removeBackground } from "../lib/backgroundRemoval.ts";
 import { Loader2, CheckCircle, AlertCircle } from "lucide-react";
 
 export default function ImageProcessor() {

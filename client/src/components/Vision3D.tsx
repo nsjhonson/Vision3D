@@ -1,12 +1,12 @@
 import { useState } from "react";
 import { Canvas } from "@react-three/fiber";
 import { OrbitControls, Environment } from "@react-three/drei";
-import ImageUploader from "./ImageUploader";
-import ImageProcessor from "./ImageProcessor";
-import ModelViewer from "./ModelViewer";
-import ModelGenerator from "./ModelGenerator";
-import ExportPanel from "./ExportPanel";
-import { useVision3D } from "../lib/stores/useVision3D";
+import ImageUploader from "./ImageUploader.tsx";
+import ImageProcessor from "./ImageProcessor.tsx";
+import ModelViewer from "./ModelViewer.tsx";
+import ModelGenerator from "./ModelGenerator.tsx";
+import ExportPanel from "./ExportPanel.tsx";
+import { useVision3D } from "../lib/stores/useVision3D.tsx";
 import { Card, CardContent, CardHeader, CardTitle } from "./ui/card";
 import { Button } from "./ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs";
