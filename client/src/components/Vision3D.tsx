@@ -169,12 +169,31 @@ export default function Vision3D() {
                 </CardHeader>
                 <CardContent>
                   <div className="h-96 bg-gray-900 rounded-lg overflow-hidden">
-                    <Canvas camera={{ position: [0, 0, 5], fov: 50 }}>
-                      <color attach="background" args={["#111111"]} />
-                      <ambientLight intensity={0.4} />
-                      <directionalLight position={[10, 10, 5]} intensity={1} />
-                      <OrbitControls enablePan enableZoom enableRotate />
-                      <Environment preset="studio" />
+                    <Canvas 
+                      camera={{ position: [3, 2, 5], fov: 60 }}
+                      shadows
+                      gl={{ 
+                        antialias: true, 
+                        alpha: false,
+                        powerPreference: "high-performance"
+                      }}
+                    >
+                      <color attach="background" args={["#0F172A"]} />
+                      <fog attach="fog" args={["#0F172A", 5, 15]} />
+                      
+                      {/* OrbitControls with smooth damping */}
+                      <OrbitControls 
+                        enablePan={true}
+                        enableZoom={true}
+                        enableRotate={true}
+                        dampingFactor={0.05}
+                        enableDamping={true}
+                        minDistance={1}
+                        maxDistance={10}
+                        maxPolarAngle={Math.PI * 0.8}
+                        target={[0, 0, 0]}
+                      />
+                      
                       {generatedModel && <ModelViewer model={generatedModel} />}
                     </Canvas>
                   </div>

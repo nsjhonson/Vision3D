@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useRef, useEffect } from "react";
 import { useFrame } from "@react-three/fiber";
 import { Mesh, BufferGeometry, Material } from "three";
 import * as THREE from "three";
@@ -14,31 +14,90 @@ interface ModelViewerProps {
 
 export default function ModelViewer({ model }: ModelViewerProps) {
   const meshRef = useRef<Mesh>(null);
+  const pointsRef = useRef<THREE.Points>(null);
+  const wireframeRef = useRef<Mesh>(null);
+
+  useEffect(() => {
+    // Ensure geometry is properly centered and scaled
+    if (meshRef.current && model.geometry) {
+      model.geometry.computeBoundingBox();
+      model.geometry.computeBoundingSphere();
+      
+      const boundingBox = model.geometry.boundingBox;
+      if (boundingBox) {
+        const center = boundingBox.getCenter(new THREE.Vector3());
+        const size = boundingBox.getSize(new THREE.Vector3());
+        const maxDimension = Math.max(size.x, size.y, size.z);
+        
+        // Center the geometry
+        model.geometry.translate(-center.x, -center.y, -center.z);
+        
+        // Scale to reasonable size (about 2 units max dimension)
+        if (maxDimension > 0) {
+          const scale = 2 / maxDimension;
+          model.geometry.scale(scale, scale, scale);
+        }
+      }
+    }
+  }, [model]);
 
   useFrame((state) => {
+    const time = state.clock.elapsedTime;
+    
+    // Smooth rotation for better viewing
     if (meshRef.current) {
-      // Gentle rotation for better viewing
-      meshRef.current.rotation.y = Math.sin(state.clock.elapsedTime * 0.2) * 0.1;
+      meshRef.current.rotation.y = time * 0.3;
+      meshRef.current.rotation.x = Math.sin(time * 0.2) * 0.1;
+    }
+    
+    if (pointsRef.current) {
+      pointsRef.current.rotation.y = time * 0.3;
+      pointsRef.current.rotation.x = Math.sin(time * 0.2) * 0.1;
+    }
+    
+    if (wireframeRef.current) {
+      wireframeRef.current.rotation.y = time * 0.3;
+      wireframeRef.current.rotation.x = Math.sin(time * 0.2) * 0.1;
     }
   });
 
   return (
     <group>
-      {/* Main 3D Model */}
-      <mesh ref={meshRef} geometry={model.geometry} material={model.material} />
+      {/* Enhanced lighting setup */}
+      <ambientLight intensity={0.6} color="#ffffff" />
+      <directionalLight 
+        position={[5, 5, 5]} 
+        intensity={0.8} 
+        color="#ffffff"
+        castShadow
+      />
+      <directionalLight 
+        position={[-5, 5, -5]} 
+        intensity={0.4} 
+        color="#4A90E2"
+      />
+      <pointLight 
+        position={[0, 3, 0]} 
+        intensity={0.5} 
+        color="#60A5FA"
+      />
+
+      {/* Main 3D Model with improved material */}
+      <mesh ref={meshRef} geometry={model.geometry} material={model.material} castShadow receiveShadow />
       
-      {/* Wireframe overlay for better visualization */}
-      <mesh geometry={model.geometry}>
+      {/* Subtle wireframe overlay */}
+      <mesh ref={wireframeRef} geometry={model.geometry}>
         <meshBasicMaterial 
-          color="#4A90E2" 
+          color="#00BFFF" 
           wireframe 
           transparent 
-          opacity={0.1} 
+          opacity={0.15}
+          side={THREE.DoubleSide}
         />
       </mesh>
 
-      {/* Point cloud representation */}
-      <points>
+      {/* Enhanced point cloud representation */}
+      <points ref={pointsRef}>
         <bufferGeometry>
           <bufferAttribute
             attach="attributes-position"
@@ -48,29 +107,37 @@ export default function ModelViewer({ model }: ModelViewerProps) {
           />
         </bufferGeometry>
         <pointsMaterial 
-          color="#60A5FA" 
-          size={0.02} 
+          color="#FFD700" 
+          size={0.015} 
           sizeAttenuation 
           transparent 
-          opacity={0.6} 
+          opacity={0.8}
+          vertexColors={true}
         />
       </points>
 
-      {/* Ground plane for reference */}
-      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -1, 0]}>
-        <planeGeometry args={[10, 10]} />
-        <meshBasicMaterial 
-          color="#1F2937" 
+      {/* Ground plane with shadow */}
+      <mesh 
+        rotation={[-Math.PI / 2, 0, 0]} 
+        position={[0, -1.5, 0]}
+        receiveShadow
+      >
+        <planeGeometry args={[8, 8]} />
+        <meshPhongMaterial 
+          color="#2D3748" 
           transparent 
-          opacity={0.3} 
+          opacity={0.4}
         />
       </mesh>
 
       {/* Grid helper */}
       <gridHelper 
-        args={[10, 20, "#374151", "#1F2937"]} 
-        position={[0, -1, 0]} 
+        args={[8, 16, "#4A5568", "#2D3748"]} 
+        position={[0, -1.5, 0]} 
       />
+      
+      {/* Coordinate axes for reference */}
+      <axesHelper args={[1]} />
     </group>
   );
 }
