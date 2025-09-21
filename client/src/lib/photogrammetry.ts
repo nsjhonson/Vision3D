@@ -1,16 +1,28 @@
 import * as THREE from "three";
 import { ProcessedImage, Generated3DModel } from "./stores/useVision3D";
 
+declare global {
+  interface Window {
+    cv: any;
+    cvReady: boolean;
+  }
+}
+
 interface FeaturePoint {
   x: number;
   y: number;
-  descriptor: number[];
+  response: number;
+  angle?: number;
+  octave?: number;
 }
 
 interface ImageFeatures {
   image: ProcessedImage;
   features: FeaturePoint[];
+  descriptors: any; // OpenCV Mat
+  keypoints: any; // OpenCV KeyPointVector
   imageIndex: number;
+  mat: any; // OpenCV Mat for the image
 }
 
 interface MatchedFeature {
@@ -19,611 +31,800 @@ interface MatchedFeature {
   image1Index: number;
   image2Index: number;
   confidence: number;
+  queryIdx: number;
+  trainIdx: number;
 }
 
 interface CameraPose {
   position: THREE.Vector3;
-  rotation: THREE.Euler;
-  focalLength: number;
+  rotation: THREE.Matrix3;
+  translation: THREE.Vector3;
+  intrinsicMatrix: THREE.Matrix3;
+  projectionMatrix: THREE.Matrix4;
+  isValid: boolean;
+  reprojectionError: number;
 }
 
 interface Point3D {
   position: THREE.Vector3;
   color: THREE.Color;
   confidence: number;
+  reprojectionError: number;
+  viewCount: number;
+}
+
+interface ReconstructionResult {
+  points3D: Point3D[];
+  cameras: CameraPose[];
+  success: boolean;
+  errorMessage?: string;
 }
 
 export async function generateModel(processedImages: ProcessedImage[]): Promise<Generated3DModel> {
-  console.log("Starting 3D model generation from", processedImages.length, "images");
+  console.log("Starting Structure-from-Motion reconstruction from", processedImages.length, "images");
   
-  // Step 1: Extract features from all images
-  const imageFeatures = await extractFeatures(processedImages);
-  console.log("Extracted features from", imageFeatures.length, "images");
+  // Wait for OpenCV to be ready
+  await waitForOpenCV();
   
-  // Step 2: Match features between image pairs
-  const matches = await matchFeatures(imageFeatures);
-  console.log("Found", matches.length, "feature matches");
-  
-  // Step 3: Estimate camera poses
-  const cameraPoses = await estimateCameraPoses(imageFeatures, matches);
-  console.log("Estimated", cameraPoses.length, "camera poses");
-  
-  // Step 4: Triangulate 3D points
-  const points3D = await triangulatePoints(imageFeatures, matches, cameraPoses);
-  console.log("Triangulated", points3D.length, "3D points");
-  
-  // Step 5: Generate mesh from point cloud
-  const model = await generateMesh(points3D, processedImages.length);
-  console.log("Generated mesh with", model.vertices.length / 3, "vertices");
-  
-  return model;
+  try {
+    // Step 1: Extract ORB features from all images
+    const imageFeatures = await extractORBFeatures(processedImages);
+    console.log("Extracted ORB features from", imageFeatures.length, "images");
+    
+    // Step 2: Match features between image pairs using robust matching
+    const matches = await robustFeatureMatching(imageFeatures);
+    console.log("Found", matches.length, "robust feature matches");
+    
+    // Step 3: Estimate camera intrinsics from EXIF or use defaults
+    const intrinsicsData = await estimateCameraIntrinsics(processedImages[0]);
+    const intrinsics = intrinsicsData.intrinsics;
+    console.log(`Estimated camera intrinsics for ${intrinsicsData.width}x${intrinsicsData.height} images`);
+    
+    // Step 4: Perform Structure-from-Motion reconstruction
+    const reconstruction = await performSfMReconstruction(imageFeatures, matches, intrinsics);
+    
+    if (!reconstruction.success) {
+      console.warn("SfM reconstruction failed:", reconstruction.errorMessage);
+      return createFallbackModel(processedImages);
+    }
+    
+    console.log("Reconstructed", reconstruction.points3D.length, "3D points from", reconstruction.cameras.length, "cameras");
+    
+    // Step 5: Generate mesh from point cloud
+    const model = await generateMeshFromPointCloud(reconstruction.points3D);
+    console.log("Generated mesh with", model.vertices.length / 3, "vertices");
+    
+    // Cleanup OpenCV resources
+    cleanupOpenCVResources(imageFeatures);
+    
+    return model;
+    
+  } catch (error) {
+    console.error("Error in photogrammetry pipeline:", error);
+    return createFallbackModel(processedImages);
+  }
 }
 
-async function extractFeatures(processedImages: ProcessedImage[]): Promise<ImageFeatures[]> {
+async function waitForOpenCV(): Promise<void> {
+  if (window.cvReady) return;
+  
+  return new Promise((resolve) => {
+    const checkCV = () => {
+      if (window.cvReady) {
+        resolve();
+      } else {
+        setTimeout(checkCV, 100);
+      }
+    };
+    checkCV();
+  });
+}
+
+async function extractORBFeatures(processedImages: ProcessedImage[]): Promise<ImageFeatures[]> {
   const imageFeatures: ImageFeatures[] = [];
+  const cv = window.cv;
+  
+  // Create ORB detector with optimized parameters
+  const orb = new cv.ORB_create(1000, 1.2, 8, 31, 0, 2, cv.ORB_HARRIS_SCORE, 31, 20);
   
   for (let i = 0; i < processedImages.length; i++) {
     const image = processedImages[i];
     
-    // Load image data
-    const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d')!;
-    const img = new Image();
-    
-    await new Promise((resolve) => {
-      img.onload = resolve;
-      img.src = image.processed;
-    });
-    
-    canvas.width = img.width;
-    canvas.height = img.height;
-    ctx.drawImage(img, 0, 0);
-    
-    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    
-    // Extract SIFT-like features (simplified)
-    const features = extractSIFTFeatures(imageData);
-    
-    imageFeatures.push({
-      image,
-      features,
-      imageIndex: i
-    });
+    try {
+      // Load image into OpenCV Mat
+      const mat = await loadImageToMat(image.processed, cv);
+      
+      // Convert to grayscale (handle both RGB and RGBA inputs)
+      const gray = new cv.Mat();
+      if (mat.channels() === 4) {
+        cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY);
+      } else if (mat.channels() === 3) {
+        cv.cvtColor(mat, gray, cv.COLOR_RGB2GRAY);
+      } else {
+        mat.copyTo(gray);
+      }
+      
+      // Detect ORB features
+      const keypoints = new cv.KeyPointVector();
+      const descriptors = new cv.Mat();
+      
+      orb.detectAndCompute(gray, new cv.Mat(), keypoints, descriptors);
+      
+      // Convert keypoints to our format
+      const features: FeaturePoint[] = [];
+      for (let j = 0; j < keypoints.size(); j++) {
+        const kp = keypoints.get(j);
+        features.push({
+          x: kp.pt.x,
+          y: kp.pt.y,
+          response: kp.response,
+          angle: kp.angle,
+          octave: kp.octave
+        });
+      }
+      
+      imageFeatures.push({
+        image,
+        features,
+        descriptors: descriptors.clone(),
+        keypoints: keypoints.clone(),
+        imageIndex: i,
+        mat: gray.clone()
+      });
+      
+      // Cleanup temporary matrices
+      mat.delete();
+      gray.delete();
+      keypoints.delete();
+      descriptors.delete();
+      
+    } catch (error) {
+      console.error(`Error extracting features from image ${i}:`, error);
+    }
   }
   
+  orb.delete();
   return imageFeatures;
 }
 
-function extractSIFTFeatures(imageData: ImageData): FeaturePoint[] {
-  const { data, width, height } = imageData;
-  const features: FeaturePoint[] = [];
-  
-  // Convert to grayscale
-  const gray = new Float32Array(width * height);
-  for (let i = 0; i < data.length; i += 4) {
-    gray[i / 4] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-  }
-  
-  // Harris corner detection (simplified)
-  const harrisResponse = new Float32Array(width * height);
-  const windowSize = 3;
-  const k = 0.04;
-  
-  for (let y = windowSize; y < height - windowSize; y++) {
-    for (let x = windowSize; x < width - windowSize; x++) {
-      let Ixx = 0, Iyy = 0, Ixy = 0;
+async function loadImageToMat(imageSrc: string, cv: any): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d')!;
       
-      for (let dy = -windowSize; dy <= windowSize; dy++) {
-        for (let dx = -windowSize; dx <= windowSize; dx++) {
-          const idx1 = (y + dy) * width + (x + dx);
-          const idx2 = (y + dy) * width + (x + dx + 1);
-          const idx3 = (y + dy + 1) * width + (x + dx);
-          
-          if (idx2 < gray.length && idx3 < gray.length) {
-            const Ix = gray[idx2] - gray[idx1];
-            const Iy = gray[idx3] - gray[idx1];
-            
-            Ixx += Ix * Ix;
-            Iyy += Iy * Iy;
-            Ixy += Ix * Iy;
-          }
-        }
+      // Limit image size for performance
+      const maxSize = 1600;
+      const scale = Math.min(maxSize / img.width, maxSize / img.height, 1);
+      
+      canvas.width = img.width * scale;
+      canvas.height = img.height * scale;
+      
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      
+      try {
+        const mat = cv.imread(canvas);
+        resolve(mat);
+      } catch (error) {
+        reject(error);
       }
-      
-      // Harris response
-      const det = Ixx * Iyy - Ixy * Ixy;
-      const trace = Ixx + Iyy;
-      harrisResponse[y * width + x] = det - k * trace * trace;
-    }
-  }
-  
-  // Non-maximum suppression and feature extraction
-  const threshold = 1000;
-  for (let y = 1; y < height - 1; y++) {
-    for (let x = 1; x < width - 1; x++) {
-      const idx = y * width + x;
-      const response = harrisResponse[idx];
-      
-      if (response > threshold) {
-        // Check if local maximum
-        let isMaximum = true;
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            if (dx === 0 && dy === 0) continue;
-            const neighborIdx = (y + dy) * width + (x + dx);
-            if (harrisResponse[neighborIdx] >= response) {
-              isMaximum = false;
-              break;
-            }
-          }
-          if (!isMaximum) break;
-        }
-        
-        if (isMaximum) {
-          // Compute descriptor (simplified)
-          const descriptor = computeDescriptor(gray, x, y, width, height);
-          features.push({ x, y, descriptor });
-        }
-      }
-    }
-  }
-  
-  return features.slice(0, 500); // Limit number of features
+    };
+    
+    img.onerror = reject;
+    img.src = imageSrc;
+  });
 }
 
-function computeDescriptor(gray: Float32Array, x: number, y: number, width: number, height: number): number[] {
-  const descriptor: number[] = [];
-  const patchSize = 8;
-  
-  for (let dy = -patchSize; dy <= patchSize; dy += 2) {
-    for (let dx = -patchSize; dx <= patchSize; dx += 2) {
-      const nx = x + dx;
-      const ny = y + dy;
-      
-      if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-        descriptor.push(gray[ny * width + nx]);
-      } else {
-        descriptor.push(0);
-      }
-    }
-  }
-  
-  // Normalize descriptor
-  const magnitude = Math.sqrt(descriptor.reduce((sum, val) => sum + val * val, 0));
-  return descriptor.map(val => magnitude > 0 ? val / magnitude : 0);
-}
-
-async function matchFeatures(imageFeatures: ImageFeatures[]): Promise<MatchedFeature[]> {
+async function robustFeatureMatching(imageFeatures: ImageFeatures[]): Promise<MatchedFeature[]> {
+  const cv = window.cv;
   const matches: MatchedFeature[] = [];
   
+  // Create BF matcher for ORB descriptors (Hamming distance)
+  const matcher = new cv.BFMatcher(cv.NORM_HAMMING, false); // crossCheck = false for knnMatch
+  
+  // Match each pair of images
   for (let i = 0; i < imageFeatures.length; i++) {
     for (let j = i + 1; j < imageFeatures.length; j++) {
-      const features1 = imageFeatures[i].features;
-      const features2 = imageFeatures[j].features;
-      
-      // Match features between image i and j
-      for (const feature1 of features1) {
-        let bestMatch: FeaturePoint | null = null;
-        let bestDistance = Infinity;
-        let secondBestDistance = Infinity;
+      try {
+        // Use knnMatch for Lowe's ratio test
+        const knnMatches = new cv.DMatchVectorVector();
+        matcher.knnMatch(imageFeatures[i].descriptors, imageFeatures[j].descriptors, knnMatches, 2);
         
-        for (const feature2 of features2) {
-          const distance = computeDescriptorDistance(feature1.descriptor, feature2.descriptor);
-          
-          if (distance < bestDistance) {
-            secondBestDistance = bestDistance;
-            bestDistance = distance;
-            bestMatch = feature2;
-          } else if (distance < secondBestDistance) {
-            secondBestDistance = distance;
+        const goodMatches: any[] = [];
+        
+        // Apply Lowe's ratio test
+        for (let k = 0; k < knnMatches.size(); k++) {
+          const match = knnMatches.get(k);
+          if (match.size() >= 2) {
+            const m1 = match.get(0);
+            const m2 = match.get(1);
+            
+            // Lowe's ratio test: distance ratio should be < 0.75
+            if (m1.distance < 0.75 * m2.distance && m1.distance < 40) {
+              goodMatches.push(m1);
+            }
           }
         }
         
-        // Lowe's ratio test
-        if (bestMatch && bestDistance < 0.7 * secondBestDistance) {
-          matches.push({
-            point1: feature1,
-            point2: bestMatch,
-            image1Index: i,
-            image2Index: j,
-            confidence: 1 - bestDistance / secondBestDistance
-          });
+        // Optional: Cross-check for additional robustness
+        const crossCheckMatches: any[] = [];
+        if (goodMatches.length > 0) {
+          const backMatches = new cv.DMatchVectorVector();
+          matcher.knnMatch(imageFeatures[j].descriptors, imageFeatures[i].descriptors, backMatches, 2);
+          
+          for (const match of goodMatches) {
+            // Check if the back-match exists
+            for (let l = 0; l < backMatches.size(); l++) {
+              const backMatch = backMatches.get(l);
+              if (backMatch.size() > 0) {
+                const bm = backMatch.get(0);
+                if (bm.queryIdx === match.trainIdx && bm.trainIdx === match.queryIdx) {
+                  crossCheckMatches.push(match);
+                  break;
+                }
+              }
+            }
+          }
+          
+          backMatches.delete();
+        }
+        
+        // Use cross-checked matches if available, otherwise use good matches
+        const finalMatches = crossCheckMatches.length > 20 ? crossCheckMatches : goodMatches;
+        
+        // Sort by distance and keep best matches
+        finalMatches.sort((a, b) => a.distance - b.distance);
+        const bestMatches = finalMatches.slice(0, Math.min(200, finalMatches.length));
+        
+        console.log(`Image pair ${i}-${j}: ${bestMatches.length} robust matches`);
+        
+        // Convert to our match format
+        for (const match of bestMatches) {
+          const point1 = imageFeatures[i].features[match.queryIdx];
+          const point2 = imageFeatures[j].features[match.trainIdx];
+          
+          if (point1 && point2) {
+            matches.push({
+              point1,
+              point2,
+              image1Index: i,
+              image2Index: j,
+              confidence: 1 / (1 + match.distance),
+              queryIdx: match.queryIdx,
+              trainIdx: match.trainIdx
+            });
+          }
+        }
+        
+        knnMatches.delete();
+        
+      } catch (error) {
+        console.error(`Error matching features between images ${i} and ${j}:`, error);
+      }
+    }
+  }
+  
+  matcher.delete();
+  console.log(`Total robust matches across all pairs: ${matches.length}`);
+  return matches;
+}
+
+async function estimateCameraIntrinsics(image: ProcessedImage): Promise<{ intrinsics: THREE.Matrix3; width: number; height: number }> {
+  // Load image to get actual dimensions after scaling
+  const cv = window.cv;
+  const mat = await loadImageToMat(image.processed, cv);
+  
+  const width = mat.cols;
+  const height = mat.rows;
+  
+  mat.delete(); // Clean up
+  
+  // Default focal length assumption (1.2 * image width is common)
+  const fx = width * 1.2;
+  const fy = fx; // Assume square pixels
+  const cx = width / 2;
+  const cy = height / 2;
+  
+  const intrinsics = new THREE.Matrix3().set(
+    fx, 0, cx,
+    0, fy, cy,
+    0, 0, 1
+  );
+  
+  return { intrinsics, width, height };
+}
+
+async function performSfMReconstruction(
+  imageFeatures: ImageFeatures[], 
+  matches: MatchedFeature[], 
+  intrinsics: THREE.Matrix3
+): Promise<ReconstructionResult> {
+  
+  if (matches.length < 50) {
+    return {
+      points3D: [],
+      cameras: [],
+      success: false,
+      errorMessage: "Insufficient feature matches for reconstruction"
+    };
+  }
+  
+  try {
+    // Find the best image pair for initialization
+    const initPair = findBestInitialPair(matches, imageFeatures);
+    if (!initPair) {
+      return {
+        points3D: [],
+        cameras: [],
+        success: false,
+        errorMessage: "Could not find suitable image pair for initialization"
+      };
+    }
+    
+    // Perform two-view reconstruction
+    const twoViewResult = await performTwoViewReconstruction(
+      initPair.matches,
+      imageFeatures[initPair.image1],
+      imageFeatures[initPair.image2],
+      intrinsics
+    );
+    
+    if (!twoViewResult.success) {
+      return {
+        points3D: [],
+        cameras: [],
+        success: false,
+        errorMessage: "Two-view reconstruction failed"
+      };
+    }
+    
+    console.log(`Two-view reconstruction successful: ${twoViewResult.points3D.length} points`);
+    
+    return {
+      points3D: twoViewResult.points3D,
+      cameras: twoViewResult.cameras,
+      success: true
+    };
+    
+  } catch (error) {
+    return {
+      points3D: [],
+      cameras: [],
+      success: false,
+      errorMessage: `SfM reconstruction error: ${error}`
+    };
+  }
+}
+
+function findBestInitialPair(matches: MatchedFeature[], imageFeatures: ImageFeatures[]) {
+  const pairCounts = new Map<string, MatchedFeature[]>();
+  
+  // Group matches by image pairs
+  for (const match of matches) {
+    const key = `${match.image1Index}-${match.image2Index}`;
+    if (!pairCounts.has(key)) {
+      pairCounts.set(key, []);
+    }
+    pairCounts.get(key)!.push(match);
+  }
+  
+  // Find pair with most matches
+  let bestPair: { image1: number; image2: number; matches: MatchedFeature[] } | null = null;
+  let maxMatches = 0;
+  
+  for (const entry of Array.from(pairCounts.entries())) {
+    const [key, pairMatches] = entry;
+    if (pairMatches.length > maxMatches && pairMatches.length >= 50) {
+      const [img1, img2] = key.split('-').map(Number);
+      bestPair = {
+        image1: img1,
+        image2: img2,
+        matches: pairMatches
+      };
+      maxMatches = pairMatches.length;
+    }
+  }
+  
+  return bestPair;
+}
+
+async function performTwoViewReconstruction(
+  matches: MatchedFeature[],
+  features1: ImageFeatures,
+  features2: ImageFeatures,
+  intrinsics: THREE.Matrix3
+): Promise<{ success: boolean; points3D: Point3D[]; cameras: CameraPose[] }> {
+  
+  const cv = window.cv;
+  
+  try {
+    // Prepare point arrays for essential matrix estimation
+    const points1 = [];
+    const points2 = [];
+    
+    for (const match of matches) {
+      points1.push(match.point1.x, match.point1.y);
+      points2.push(match.point2.x, match.point2.y);
+    }
+    
+    const pts1 = cv.matFromArray(matches.length, 1, cv.CV_32FC2, points1);
+    const pts2 = cv.matFromArray(matches.length, 1, cv.CV_32FC2, points2);
+    
+    // Create camera matrix (THREE.Matrix3 is row-major, use elements directly)
+    const K = cv.matFromArray(3, 3, cv.CV_64F, [
+      intrinsics.elements[0], intrinsics.elements[1], intrinsics.elements[2],
+      intrinsics.elements[3], intrinsics.elements[4], intrinsics.elements[5],
+      intrinsics.elements[6], intrinsics.elements[7], intrinsics.elements[8]
+    ]);
+    
+    // Estimate essential matrix using RANSAC
+    const essentialMatrix = cv.findEssentialMat(pts1, pts2, K, cv.RANSAC, 0.999, 1.0);
+    
+    if (essentialMatrix.rows === 0) {
+      pts1.delete();
+      pts2.delete();
+      K.delete();
+      essentialMatrix.delete();
+      return { success: false, points3D: [], cameras: [] };
+    }
+    
+    // Recover pose from essential matrix
+    const R = new cv.Mat();
+    const t = new cv.Mat();
+    const mask = new cv.Mat();
+    
+    const inlierCount = cv.recoverPose(essentialMatrix, pts1, pts2, K, R, t, mask);
+    console.log(`Pose recovery: ${inlierCount}/${matches.length} inliers`);
+    
+    if (inlierCount < 50) {
+      pts1.delete();
+      pts2.delete();
+      K.delete();
+      essentialMatrix.delete();
+      R.delete();
+      t.delete();
+      mask.delete();
+      return { success: false, points3D: [], cameras: [] };
+    }
+    
+    // Create camera poses
+    const camera1: CameraPose = {
+      position: new THREE.Vector3(0, 0, 0),
+      rotation: new THREE.Matrix3().identity(),
+      translation: new THREE.Vector3(0, 0, 0),
+      intrinsicMatrix: intrinsics.clone(),
+      projectionMatrix: new THREE.Matrix4(),
+      isValid: true,
+      reprojectionError: 0
+    };
+    
+    // Extract rotation matrix elements
+    const RArray = [];
+    for (let i = 0; i < 9; i++) {
+      RArray.push(R.data64F[i]);
+    }
+    
+    // Extract translation vector
+    const tVec = new THREE.Vector3(t.data64F[0], t.data64F[1], t.data64F[2]);
+    
+    // Camera 2 position: C = -R^T * t
+    const RMat = new THREE.Matrix3().fromArray(RArray);
+    const RTMat = RMat.clone().transpose();
+    const camera2Position = tVec.clone().negate().applyMatrix3(RTMat);
+    
+    const camera2: CameraPose = {
+      position: camera2Position,
+      rotation: RMat,
+      translation: tVec,
+      intrinsicMatrix: intrinsics.clone(),
+      projectionMatrix: new THREE.Matrix4(),
+      isValid: true,
+      reprojectionError: 0
+    };
+    
+    // Triangulate 3D points using OpenCV
+    const points3D = await triangulatePointsOpenCV(matches, camera1, camera2, intrinsics, mask, pts1, pts2, K, R, t);
+    
+    // Cleanup OpenCV resources
+    pts1.delete();
+    pts2.delete();
+    K.delete();
+    essentialMatrix.delete();
+    R.delete();
+    t.delete();
+    mask.delete();
+    
+    return {
+      success: true,
+      points3D,
+      cameras: [camera1, camera2]
+    };
+    
+  } catch (error) {
+    console.error("Two-view reconstruction error:", error);
+    return { success: false, points3D: [], cameras: [] };
+  }
+}
+
+async function triangulatePointsOpenCV(
+  matches: MatchedFeature[],
+  camera1: CameraPose,
+  camera2: CameraPose,
+  intrinsics: THREE.Matrix3,
+  mask: any,
+  pts1: any,
+  pts2: any,
+  K: any,
+  R: any,
+  t: any
+): Promise<Point3D[]> {
+  
+  const cv = window.cv;
+  const points3D: Point3D[] = [];
+  
+  try {
+    // Create projection matrices
+    // P1 = K[I|0]
+    const I = cv.Mat.eye(3, 3, cv.CV_64F);
+    const zeros = cv.Mat.zeros(3, 1, cv.CV_64F);
+    const Rt1 = new cv.Mat();
+    cv.hconcat(I, zeros, Rt1);
+    const P1 = new cv.Mat();
+    cv.gemm(K, Rt1, 1, new cv.Mat(), 0, P1);
+    
+    // P2 = K[R|t]
+    const Rt2 = new cv.Mat();
+    cv.hconcat(R, t, Rt2);
+    const P2 = new cv.Mat();
+    cv.gemm(K, Rt2, 1, new cv.Mat(), 0, P2);
+    
+    // Filter inlier points
+    const inlierPts1 = [];
+    const inlierPts2 = [];
+    const inlierMatches = [];
+    
+    for (let i = 0; i < matches.length; i++) {
+      if (mask.ucharPtr(i, 0)[0] !== 0) { // Is inlier
+        inlierPts1.push(matches[i].point1.x, matches[i].point1.y);
+        inlierPts2.push(matches[i].point2.x, matches[i].point2.y);
+        inlierMatches.push(matches[i]);
+      }
+    }
+    
+    if (inlierPts1.length < 10) {
+      I.delete();
+      zeros.delete();
+      Rt1.delete();
+      P1.delete();
+      Rt2.delete();
+      P2.delete();
+      return points3D;
+    }
+    
+    const inlierMat1 = cv.matFromArray(inlierPts1.length / 2, 1, cv.CV_32FC2, inlierPts1);
+    const inlierMat2 = cv.matFromArray(inlierPts2.length / 2, 1, cv.CV_32FC2, inlierPts2);
+    
+    // Triangulate points
+    const points4D = new cv.Mat();
+    cv.triangulatePoints(P1, P2, inlierMat1, inlierMat2, points4D);
+    
+    // Convert from homogeneous to 3D coordinates
+    for (let i = 0; i < points4D.cols; i++) {
+      const X = points4D.data64F[i * 4];
+      const Y = points4D.data64F[i * 4 + 1];
+      const Z = points4D.data64F[i * 4 + 2];
+      const W = points4D.data64F[i * 4 + 3];
+      
+      if (Math.abs(W) > 1e-6) {
+        const x = X / W;
+        const y = Y / W;
+        const z = Z / W;
+        
+        // Complete cheirality check - point should be in front of both cameras
+        const point3D = new THREE.Vector3(x, y, z);
+        
+        // Check depth in camera 1 (world frame, z > 0)
+        const depthCam1 = z;
+        
+        // Check depth in camera 2: (R*X + t).z > 0
+        const Rcam2 = camera2.rotation;
+        const tcam2 = camera2.translation;
+        const pointCam2 = point3D.clone().applyMatrix3(Rcam2).add(tcam2);
+        const depthCam2 = pointCam2.z;
+        
+        if (depthCam1 > 0 && depthCam2 > 0) {
+          // Calculate reprojection error
+          const reprojError = calculateReprojectionError(
+            point3D,
+            inlierMatches[i],
+            camera1,
+            camera2,
+            intrinsics
+          );
+          
+          if (reprojError < 2.0) { // 2 pixel threshold
+            points3D.push({
+              position: point3D,
+              color: new THREE.Color(0.7 + Math.random() * 0.3, 0.7 + Math.random() * 0.3, 0.9),
+              confidence: 1.0 - (reprojError / 2.0),
+              reprojectionError: reprojError,
+              viewCount: 2
+            });
+          }
         }
       }
     }
+    
+    // Cleanup
+    I.delete();
+    zeros.delete();
+    Rt1.delete();
+    P1.delete();
+    Rt2.delete();
+    P2.delete();
+    inlierMat1.delete();
+    inlierMat2.delete();
+    points4D.delete();
+    
+  } catch (error) {
+    console.error("OpenCV triangulation error:", error);
   }
   
-  return matches.sort((a, b) => b.confidence - a.confidence).slice(0, 1000);
+  return points3D;
 }
 
-function computeDescriptorDistance(desc1: number[], desc2: number[]): number {
-  let distance = 0;
-  for (let i = 0; i < Math.min(desc1.length, desc2.length); i++) {
-    distance += Math.pow(desc1[i] - desc2[i], 2);
-  }
-  return Math.sqrt(distance);
-}
-
-async function estimateCameraPoses(imageFeatures: ImageFeatures[], matches: MatchedFeature[]): Promise<CameraPose[]> {
-  const poses: CameraPose[] = [];
+function calculateReprojectionError(
+  point3D: THREE.Vector3,
+  match: MatchedFeature,
+  camera1: CameraPose,
+  camera2: CameraPose,
+  intrinsics: THREE.Matrix3
+): number {
   
-  // Initialize first camera at origin
-  poses.push({
-    position: new THREE.Vector3(0, 0, 0),
-    rotation: new THREE.Euler(0, 0, 0),
-    focalLength: 800 // Assumed focal length
+  // Project 3D point to camera 1
+  const proj1 = projectPoint(point3D, camera1, intrinsics);
+  const error1 = Math.sqrt(
+    Math.pow(proj1.x - match.point1.x, 2) + 
+    Math.pow(proj1.y - match.point1.y, 2)
+  );
+  
+  // Project 3D point to camera 2
+  const proj2 = projectPoint(point3D, camera2, intrinsics);
+  const error2 = Math.sqrt(
+    Math.pow(proj2.x - match.point2.x, 2) + 
+    Math.pow(proj2.y - match.point2.y, 2)
+  );
+  
+  return (error1 + error2) / 2;
+}
+
+function projectPoint(
+  point3D: THREE.Vector3,
+  camera: CameraPose,
+  intrinsics: THREE.Matrix3
+): { x: number; y: number } {
+  
+  // Transform to camera coordinates: X_c = R * (X - C)
+  // where R is world-to-camera rotation and C is camera position
+  const relativePoint = point3D.clone().sub(camera.position);
+  const camPoint = relativePoint.applyMatrix3(camera.rotation);
+  
+  // Project using intrinsic matrix (THREE.Matrix3 is row-major)
+  const fx = intrinsics.elements[0];
+  const fy = intrinsics.elements[4];
+  const cx = intrinsics.elements[2]; // Correct: cx is at elements[2] in row-major THREE.Matrix3
+  const cy = intrinsics.elements[5]; // Correct: cy is at elements[5] in row-major THREE.Matrix3
+  
+  const x = (camPoint.x / camPoint.z) * fx + cx;
+  const y = (camPoint.y / camPoint.z) * fy + cy;
+  
+  return { x, y };
+}
+
+function unprojectPoint(
+  point: FeaturePoint,
+  camera: CameraPose,
+  intrinsics: THREE.Matrix3
+): { origin: THREE.Vector3; direction: THREE.Vector3 } {
+  
+  // Convert image coordinates to normalized coordinates (THREE.Matrix3 is row-major)
+  const fx = intrinsics.elements[0];
+  const fy = intrinsics.elements[4];
+  const cx = intrinsics.elements[2]; // Correct: cx is at elements[2] in row-major THREE.Matrix3
+  const cy = intrinsics.elements[5]; // Correct: cy is at elements[5] in row-major THREE.Matrix3
+  
+  const x = (point.x - cx) / fx;
+  const y = (point.y - cy) / fy;
+  
+  // Create ray in camera coordinate system
+  const direction = new THREE.Vector3(x, y, 1).normalize();
+  
+  // Transform to world coordinates: R^T * direction for direction, camera.position for origin
+  const worldDirection = direction.clone().applyMatrix3(camera.rotation.clone().transpose());
+  const worldOrigin = camera.position.clone();
+  
+  return { origin: worldOrigin, direction: worldDirection };
+}
+
+async function generateMeshFromPointCloud(points3D: Point3D[]): Promise<Generated3DModel> {
+  if (points3D.length === 0) {
+    console.warn("No 3D points to generate mesh from");
+    return createEmptyModel();
+  }
+  
+  console.log(`Creating point cloud visualization from ${points3D.length} reconstructed points`);
+  
+  // Create vertices and colors arrays
+  const vertices: number[] = [];
+  const colors: number[] = [];
+  
+  for (const point of points3D) {
+    vertices.push(point.position.x, point.position.y, point.position.z);
+    colors.push(point.color.r, point.color.g, point.color.b);
+  }
+  
+  // Create Three.js geometry for point cloud
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+  geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  
+  // Compute bounding sphere for better rendering
+  geometry.computeBoundingSphere();
+  
+  // Create point material instead of mesh material
+  const material = new THREE.PointsMaterial({
+    size: 0.02,
+    vertexColors: true,
+    sizeAttenuation: true,
+    transparent: true,
+    opacity: 0.8
   });
   
-  // Estimate poses for other cameras using fundamental matrix
-  for (let i = 1; i < imageFeatures.length; i++) {
-    // Find matches between first image and current image
-    const imageMatches = matches.filter(m => 
-      (m.image1Index === 0 && m.image2Index === i) ||
-      (m.image1Index === i && m.image2Index === 0)
-    );
-    
-    if (imageMatches.length >= 8) {
-      // Use a simplified pose estimation
-      const angle = (i / imageFeatures.length) * 2 * Math.PI;
-      const radius = 3;
-      
-      poses.push({
-        position: new THREE.Vector3(
-          radius * Math.cos(angle),
-          0,
-          radius * Math.sin(angle)
-        ),
-        rotation: new THREE.Euler(0, -angle, 0),
-        focalLength: 800
-      });
-    } else {
-      // Default pose if not enough matches
-      poses.push({
-        position: new THREE.Vector3(i * 0.5 - imageFeatures.length * 0.25, 0, 2),
-        rotation: new THREE.Euler(0, 0, 0),
-        focalLength: 800
-      });
-    }
-  }
+  // For now, don't create triangulated faces - just render as point cloud
+  // This avoids artifacts from incorrect triangulation
+  const faces = new Uint32Array(); // Empty faces array
   
-  return poses;
-}
-
-async function triangulatePoints(
-  imageFeatures: ImageFeatures[], 
-  matches: MatchedFeature[], 
-  cameraPoses: CameraPose[]
-): Promise<Point3D[]> {
-  console.log("Analyzing images to create 3D shape...");
-  
-  // Extract actual shape information from processed images
-  const shapeBounds = await analyzeImageShapes(imageFeatures);
-  console.log("Shape analysis complete:", shapeBounds);
-  
-  return generateShapeBasedPointCloud(shapeBounds, imageFeatures);
-}
-
-async function analyzeImageShapes(imageFeatures: ImageFeatures[]) {
-  const shapes = [];
-  
-  for (const imageFeature of imageFeatures) {
-    const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d')!;
-    const img = new Image();
-    
-    await new Promise((resolve) => {
-      img.onload = resolve;
-      img.src = imageFeature.image.processed;
-    });
-    
-    canvas.width = img.width;
-    canvas.height = img.height;
-    ctx.drawImage(img, 0, 0);
-    
-    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const shape = extractObjectBounds(imageData);
-    shapes.push(shape);
-  }
-  
-  return shapes;
-}
-
-function extractObjectBounds(imageData: ImageData) {
-  const { data, width, height } = imageData;
-  let minX = width, maxX = 0, minY = height, maxY = 0;
-  let pixelCount = 0;
-  let totalR = 0, totalG = 0, totalB = 0;
-  
-  // Find bounding box of non-transparent pixels
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const idx = (y * width + x) * 4;
-      const alpha = data[idx + 3];
-      
-      if (alpha > 128) { // Non-transparent pixel
-        minX = Math.min(minX, x);
-        maxX = Math.max(maxX, x);
-        minY = Math.min(minY, y);
-        maxY = Math.max(maxY, y);
-        pixelCount++;
-        
-        totalR += data[idx];
-        totalG += data[idx + 1];
-        totalB += data[idx + 2];
-      }
-    }
-  }
-  
-  const centerX = (minX + maxX) / 2 / width;
-  const centerY = (minY + maxY) / 2 / height;
-  const objectWidth = (maxX - minX) / width;
-  const objectHeight = (maxY - minY) / height;
-  const density = pixelCount / (width * height);
-  
-  // Average color
-  const avgColor = pixelCount > 0 ? {
-    r: totalR / pixelCount / 255,
-    g: totalG / pixelCount / 255,
-    b: totalB / pixelCount / 255
-  } : { r: 0.5, g: 0.5, b: 0.5 };
+  console.log("Point cloud model created successfully");
   
   return {
-    centerX,
-    centerY,
-    objectWidth,
-    objectHeight,
-    density,
-    avgColor,
-    aspectRatio: objectHeight > 0 ? objectWidth / objectHeight : 1
+    geometry,
+    material,
+    vertices: new Float32Array(vertices),
+    faces: faces
   };
 }
 
-function generateShapeBasedPointCloud(shapeBounds: any[], imageFeatures: ImageFeatures[]): Point3D[] {
-  const points3D: Point3D[] = [];
-  
-  if (shapeBounds.length === 0) {
-    console.warn("No shape data found, creating default shape");
-    return createDefaultShape();
-  }
-  
-  // Calculate average shape properties
-  const avgWidth = shapeBounds.reduce((sum, s) => sum + s.objectWidth, 0) / shapeBounds.length;
-  const avgHeight = shapeBounds.reduce((sum, s) => sum + s.objectHeight, 0) / shapeBounds.length;
-  const avgAspectRatio = shapeBounds.reduce((sum, s) => sum + s.aspectRatio, 0) / shapeBounds.length;
-  const avgDensity = shapeBounds.reduce((sum, s) => sum + s.density, 0) / shapeBounds.length;
-  
-  // Estimate 3D shape from 2D projections
-  const scaleX = Math.max(0.5, avgWidth * 3);
-  const scaleY = Math.max(0.5, avgHeight * 3);
-  const scaleZ = Math.max(0.5, Math.sqrt(avgDensity) * 2); // Depth based on density
-  
-  console.log(`Creating 3D shape: ${scaleX.toFixed(2)}x${scaleY.toFixed(2)}x${scaleZ.toFixed(2)}`);
-  
-  // Generate points based on estimated shape
-  const numPoints = Math.max(500, Math.min(2000, Math.floor(avgDensity * 3000)));
-  
-  for (let i = 0; i < numPoints; i++) {
-    // Create ellipsoid-like distribution based on image analysis
-    const phi = Math.random() * Math.PI * 2;
-    const theta = Math.acos(2 * Math.random() - 1);
-    
-    // Apply shape-based scaling
-    let x = Math.sin(theta) * Math.cos(phi) * scaleX;
-    let y = Math.sin(theta) * Math.sin(phi) * scaleY;
-    let z = Math.cos(theta) * scaleZ;
-    
-    // Add shape variation based on aspect ratio
-    if (avgAspectRatio < 0.7) { // Wide object
-      y *= 0.7;
-      z *= 1.2;
-    } else if (avgAspectRatio > 1.4) { // Tall object
-      y *= 1.3;
-      x *= 0.8;
-    }
-    
-    // Sample color from one of the images
-    const shapeIndex = Math.floor(Math.random() * shapeBounds.length);
-    const shape = shapeBounds[shapeIndex];
-    const color = new THREE.Color(shape.avgColor.r, shape.avgColor.g, shape.avgColor.b);
-    
-    // Add some color variation
-    color.offsetHSL(
-      (Math.random() - 0.5) * 0.1, // Slight hue variation
-      (Math.random() - 0.5) * 0.2, // Saturation variation
-      (Math.random() - 0.5) * 0.3  // Lightness variation
-    );
-    
-    points3D.push({
-      position: new THREE.Vector3(x, y, z),
-      color: color,
-      confidence: 0.7 + Math.random() * 0.3
-    });
-  }
-  
-  return points3D;
+function createFallbackModel(processedImages: ProcessedImage[]): Generated3DModel {
+  console.log("Creating fallback model due to SfM failure");
+  return createEmptyModel();
 }
 
-function createDefaultShape(): Point3D[] {
-  console.log("Creating default cube shape");
-  const points3D: Point3D[] = [];
+function createEmptyModel(): Generated3DModel {
+  const geometry = new THREE.BoxGeometry(1, 1, 1);
+  const material = new THREE.MeshPhongMaterial({ color: 0x888888 });
   
-  // Create a simple cube when no image data is available
-  for (let i = 0; i < 800; i++) {
-    const x = (Math.random() - 0.5) * 2;
-    const y = (Math.random() - 0.5) * 2;
-    const z = (Math.random() - 0.5) * 2;
-    
-    points3D.push({
-      position: new THREE.Vector3(x, y, z),
-      color: new THREE.Color(0.6, 0.6, 0.7),
-      confidence: 0.5
-    });
-  }
-  
-  return points3D;
-}
-
-function triangulatePoint(
-  point1: FeaturePoint, 
-  point2: FeaturePoint,
-  pose1: CameraPose, 
-  pose2: CameraPose
-): Point3D | null {
-  try {
-    // More realistic triangulation
-    const imageWidth = 640;
-    const imageHeight = 480;
-    
-    // Convert image coordinates to normalized device coordinates
-    const ndc1 = new THREE.Vector3(
-      (point1.x - imageWidth / 2) / pose1.focalLength,
-      (point1.y - imageHeight / 2) / pose1.focalLength,
-      1
-    );
-    
-    const ndc2 = new THREE.Vector3(
-      (point2.x - imageWidth / 2) / pose2.focalLength,
-      (point2.y - imageHeight / 2) / pose2.focalLength,
-      1
-    );
-    
-    // Apply camera rotations
-    ndc1.applyEuler(pose1.rotation);
-    ndc2.applyEuler(pose2.rotation);
-    
-    // Calculate ray directions
-    const dir1 = ndc1.normalize();
-    const dir2 = ndc2.normalize();
-    
-    // Find closest point between two rays
-    const w = pose1.position.clone().sub(pose2.position);
-    const a = dir1.dot(dir1);
-    const b = dir1.dot(dir2);
-    const c = dir2.dot(dir2);
-    const d = dir1.dot(w);
-    const e = dir2.dot(w);
-    
-    const denom = a * c - b * b;
-    if (Math.abs(denom) < 0.001) return null; // Rays are parallel
-    
-    const t1 = (b * e - c * d) / denom;
-    const t2 = (a * e - b * d) / denom;
-    
-    // Calculate 3D point
-    const point1_3d = pose1.position.clone().add(dir1.multiplyScalar(t1));
-    const point2_3d = pose2.position.clone().add(dir2.multiplyScalar(t2));
-    
-    // Average the two points
-    const triangulatedPoint = point1_3d.add(point2_3d).multiplyScalar(0.5);
-    
-    // Check if point is reasonable (not too far from cameras)
-    const distanceFromCamera1 = triangulatedPoint.distanceTo(pose1.position);
-    const distanceFromCamera2 = triangulatedPoint.distanceTo(pose2.position);
-    
-    if (distanceFromCamera1 > 10 || distanceFromCamera2 > 10) {
-      return null; // Point too far away
-    }
-    
-    // Calculate color based on descriptor similarity
-    const colorIntensity = Math.max(0.3, 1 - point1.descriptor.reduce((sum, val, i) => 
-      sum + Math.abs(val - (point2.descriptor[i] || 0)), 0) / point1.descriptor.length);
-    
-    return {
-      position: triangulatedPoint,
-      color: new THREE.Color(colorIntensity, colorIntensity * 0.8, colorIntensity * 0.6),
-      confidence: Math.min(1, colorIntensity * 2)
-    };
-  } catch (error) {
-    return null;
-  }
-}
-
-async function generateMesh(points3D: Point3D[], sourceImageCount: number): Promise<Generated3DModel> {
-  // Convert points to vertices array
-  const vertices = new Float32Array(points3D.length * 3);
-  const colors = new Float32Array(points3D.length * 3);
-  
-  for (let i = 0; i < points3D.length; i++) {
-    const point = points3D[i];
-    vertices[i * 3] = point.position.x;
-    vertices[i * 3 + 1] = point.position.y;
-    vertices[i * 3 + 2] = point.position.z;
-    
-    colors[i * 3] = point.color.r;
-    colors[i * 3 + 1] = point.color.g;
-    colors[i * 3 + 2] = point.color.b;
-  }
-  
-  // Create Delaunay triangulation (simplified)
-  const faces = generateDelaunayTriangulation(points3D);
-  
-  // Create Three.js geometry
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
-  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-  geometry.setIndex(Array.from(faces));
-  geometry.computeVertexNormals();
-  
-  // Create material
-  const material = new THREE.MeshLambertMaterial({
-    vertexColors: true,
-    side: THREE.DoubleSide
-  });
+  const vertices = geometry.attributes.position.array as Float32Array;
+  const faces = geometry.index?.array as Uint32Array || new Uint32Array();
   
   return {
     geometry,
     material,
     vertices,
-    faces,
-    sourceImageCount
+    faces
   };
 }
 
-function generateDelaunayTriangulation(points3D: Point3D[]): Uint32Array {
-  const faces: number[] = [];
-  
-  // Create a more structured mesh by connecting nearby points
-  // Sort points by distance from center for better connectivity
-  const sortedPoints = points3D.map((point, index) => ({
-    index,
-    point,
-    distance: point.position.length()
-  })).sort((a, b) => a.distance - b.distance);
-  
-  // Create triangular mesh by connecting points in layers
-  const layerSize = Math.floor(Math.sqrt(points3D.length / 4));
-  
-  for (let layer = 0; layer < 4; layer++) {
-    const startIdx = layer * layerSize * layerSize;
-    const endIdx = Math.min((layer + 1) * layerSize * layerSize, sortedPoints.length);
-    
-    for (let i = startIdx; i < endIdx - layerSize - 1; i++) {
-      const current = sortedPoints[i].index;
-      const right = sortedPoints[i + 1]?.index;
-      const down = sortedPoints[i + layerSize]?.index;
-      const diag = sortedPoints[i + layerSize + 1]?.index;
-      
-      // Create two triangles for each quad
-      if (right !== undefined && down !== undefined) {
-        faces.push(current, right, down);
-        
-        if (diag !== undefined) {
-          faces.push(right, diag, down);
-        }
-      }
+function cleanupOpenCVResources(imageFeatures: ImageFeatures[]) {
+  for (const features of imageFeatures) {
+    try {
+      if (features.descriptors) features.descriptors.delete();
+      if (features.keypoints) features.keypoints.delete();
+      if (features.mat) features.mat.delete();
+    } catch (error) {
+      console.warn("Error cleaning up OpenCV resources:", error);
     }
   }
-  
-  // Add radial connections for better surface
-  const centerIdx = 0;
-  const numRadialConnections = Math.min(100, points3D.length / 10);
-  
-  for (let i = 1; i < numRadialConnections; i++) {
-    const next = (i + 1) % numRadialConnections;
-    if (next < points3D.length) {
-      faces.push(centerIdx, i, next);
-    }
-  }
-  
-  return new Uint32Array(faces);
 }

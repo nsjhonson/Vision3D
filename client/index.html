@@ -3,9 +3,19 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1" />
+    <title>Vision3D - Photogrammetry Tool</title>
   </head>
   <body>
     <div id="root"></div>
+    <script async src="https://docs.opencv.org/4.5.0/opencv.js" onload="onOpenCvReady();" type="text/javascript"></script>
+    <script>
+      function onOpenCvReady() {
+        console.log('OpenCV.js is ready');
+        window.cvReady = true;
+        // Dispatch event for React components to listen
+        window.dispatchEvent(new Event('opencv-ready'));
+      }
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

@@ -82,39 +82,49 @@ export default function ModelViewer({ model }: ModelViewerProps) {
         color="#60A5FA"
       />
 
-      {/* Main 3D Model with improved material */}
-      <mesh ref={meshRef} geometry={model.geometry} material={model.material} castShadow receiveShadow />
-      
-      {/* Subtle wireframe overlay */}
-      <mesh ref={wireframeRef} geometry={model.geometry}>
-        <meshBasicMaterial 
-          color="#00BFFF" 
-          wireframe 
-          transparent 
-          opacity={0.15}
-          side={THREE.DoubleSide}
-        />
-      </mesh>
+      {/* Render based on model type */}
+      {model.material instanceof THREE.PointsMaterial ? (
+        // Point cloud rendering for SfM reconstruction
+        <points ref={pointsRef} geometry={model.geometry} material={model.material} />
+      ) : (
+        // Mesh rendering for traditional models
+        <>
+          <mesh ref={meshRef} geometry={model.geometry} material={model.material} castShadow receiveShadow />
+          
+          {/* Subtle wireframe overlay for mesh */}
+          <mesh ref={wireframeRef} geometry={model.geometry}>
+            <meshBasicMaterial 
+              color="#00BFFF" 
+              wireframe 
+              transparent 
+              opacity={0.15}
+              side={THREE.DoubleSide}
+            />
+          </mesh>
+        </>
+      )}
 
-      {/* Enhanced point cloud representation */}
-      <points ref={pointsRef}>
-        <bufferGeometry>
-          <bufferAttribute
-            attach="attributes-position"
-            array={model.vertices}
-            count={model.vertices.length / 3}
-            itemSize={3}
+      {/* Additional point cloud overlay for mesh models */}
+      {!(model.material instanceof THREE.PointsMaterial) && model.vertices.length > 0 && (
+        <points>
+          <bufferGeometry>
+            <bufferAttribute
+              attach="attributes-position"
+              array={model.vertices}
+              count={model.vertices.length / 3}
+              itemSize={3}
+            />
+          </bufferGeometry>
+          <pointsMaterial 
+            color="#FFD700" 
+            size={0.01} 
+            sizeAttenuation 
+            transparent 
+            opacity={0.4}
+            vertexColors={false}
           />
-        </bufferGeometry>
-        <pointsMaterial 
-          color="#FFD700" 
-          size={0.015} 
-          sizeAttenuation 
-          transparent 
-          opacity={0.8}
-          vertexColors={true}
-        />
-      </points>
+        </points>
+      )}
 
       {/* Ground plane with shadow */}
       <mesh 
